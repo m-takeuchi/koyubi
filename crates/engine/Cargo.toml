@@ -1,0 +1,11 @@
+[package]
+name = "koyubi-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Platform-independent SKK input method engine for Koyubi"
+license = "MIT"
+
+[dependencies]
+encoding_rs = "0.8"
+
+[dev-dependencies]
