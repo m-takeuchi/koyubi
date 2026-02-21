@@ -126,6 +126,13 @@ impl RomajiConverter {
         self.pending.clear();
     }
 
+    /// 未確定ローマ字の末尾を1文字削除（Backspace用）
+    ///
+    /// 削除できた場合は true、既に空なら false を返す。
+    pub fn backspace(&mut self) -> bool {
+        self.pending.pop().is_some()
+    }
+
     /// 未確定状態を確定する（Enter/確定時に呼ぶ）
     ///
     /// 未確定が "n" の場合は "ん" を出力する。
