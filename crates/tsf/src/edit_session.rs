@@ -9,10 +9,11 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use windows::core::{implement, Interface as _};
+use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
-    ITfEditSession_Impl, ITfInsertAtSelection, ITfRange, INSERT_TEXT_AT_SELECTION_FLAGS,
-    TF_ANCHOR_END, TF_AE_NONE, TF_SELECTION, TF_SELECTIONSTYLE,
+    ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfContextView,
+    ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection, ITfRange,
+    INSERT_TEXT_AT_SELECTION_FLAGS, TF_ANCHOR_END, TF_AE_NONE, TF_SELECTION, TF_SELECTIONSTYLE,
 };
 use windows_core::BOOL;
 
@@ -214,6 +215,50 @@ impl ITfEditSession_Impl for EndCompositionEditSession_Impl {
             range.SetText(ec, 0, &[])?;
             self.composition.EndComposition(ec)?;
             dbglog!("EndCompositionEditSession: done");
+        }
+        Ok(())
+    }
+}
+
+// =========================================================
+// GetTextExtEditSession: コンポジション位置のスクリーン座標を取得
+// =========================================================
+
+#[implement(ITfEditSession)]
+pub struct GetTextExtEditSession {
+    context: ITfContext,
+    composition: ITfComposition,
+    result: Rc<RefCell<Option<RECT>>>,
+}
+
+impl GetTextExtEditSession {
+    pub fn new(
+        context: ITfContext,
+        composition: ITfComposition,
+        result: Rc<RefCell<Option<RECT>>>,
+    ) -> Self {
+        Self {
+            context,
+            composition,
+            result,
+        }
+    }
+}
+
+impl ITfEditSession_Impl for GetTextExtEditSession_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        dbglog!("GetTextExtEditSession::DoEditSession ec={}", ec);
+        unsafe {
+            let range: ITfRange = self.composition.GetRange()?;
+            let view: ITfContextView = self.context.GetActiveView()?;
+            let mut rect = RECT::default();
+            let mut clipped = BOOL(0);
+            view.GetTextExt(ec, &range, &mut rect, &mut clipped)?;
+            dbglog!(
+                "GetTextExtEditSession: rect=({},{},{},{}) clipped={}",
+                rect.left, rect.top, rect.right, rect.bottom, clipped.0
+            );
+            *self.result.borrow_mut() = Some(rect);
         }
         Ok(())
     }

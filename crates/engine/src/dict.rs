@@ -134,6 +134,63 @@ impl Dictionary {
     pub fn entry_count(&self) -> usize {
         self.okuri_nashi.len() + self.okuri_ari.len()
     }
+
+    /// エントリを追加（先頭に挿入、重複はスキップ）
+    pub fn add_entry(&mut self, reading: &str, entry: DictEntry) {
+        let map = if is_okuri_ari(reading) {
+            &mut self.okuri_ari
+        } else {
+            &mut self.okuri_nashi
+        };
+        let entries = map.entry(reading.to_string()).or_default();
+        if !entries.iter().any(|e| e.word == entry.word) {
+            entries.insert(0, entry);
+        }
+    }
+
+    /// SKK-JISYO 形式にシリアライズ
+    pub fn to_skk_string(&self) -> String {
+        let mut lines = Vec::new();
+        // 送りありエントリ
+        let mut okuri_ari: Vec<_> = self.okuri_ari.iter().collect();
+        okuri_ari.sort_by(|a, b| a.0.cmp(b.0));
+        for (reading, entries) in &okuri_ari {
+            lines.push(format_dict_line(reading, entries));
+        }
+        // 送りなしエントリ
+        let mut okuri_nashi: Vec<_> = self.okuri_nashi.iter().collect();
+        okuri_nashi.sort_by(|a, b| a.0.cmp(b.0));
+        for (reading, entries) in &okuri_nashi {
+            lines.push(format_dict_line(reading, entries));
+        }
+        lines.join("\n")
+    }
+
+    /// UTF-8 で辞書ファイルに保存
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), DictError> {
+        if let Some(parent) = path.as_ref().parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = self.to_skk_string();
+        std::fs::write(path, content.as_bytes())?;
+        Ok(())
+    }
+}
+
+/// 辞書の1行をフォーマット
+///
+/// `reading /word1/word2;annotation/` 形式
+fn format_dict_line(reading: &str, entries: &[DictEntry]) -> String {
+    let mut line = format!("{} /", reading);
+    for entry in entries {
+        line.push_str(&entry.word);
+        if let Some(ann) = &entry.annotation {
+            line.push(';');
+            line.push_str(ann);
+        }
+        line.push('/');
+    }
+    line
 }
 
 impl Default for Dictionary {
@@ -146,7 +203,7 @@ impl Default for Dictionary {
 ///
 /// 読みの末尾が ASCII 小文字（a-z）なら送りあり。
 /// 例: "おおk" → true, "かんじ" → false
-fn is_okuri_ari(reading: &str) -> bool {
+pub fn is_okuri_ari(reading: &str) -> bool {
     reading
         .as_bytes()
         .last()
@@ -552,5 +609,120 @@ mod tests {
         let dict = Dictionary::new();
         assert_eq!(dict.entry_count(), 0);
         assert!(dict.lookup("かんじ").is_none());
+    }
+
+    // === add_entry テスト ===
+
+    #[test]
+    fn test_add_entry_basic() {
+        let mut dict = Dictionary::new();
+        dict.add_entry(
+            "てすと",
+            DictEntry {
+                word: "テスト".to_string(),
+                annotation: None,
+            },
+        );
+        let entries = dict.lookup("てすと").expect("should exist");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].word, "テスト");
+    }
+
+    #[test]
+    fn test_add_entry_prepend() {
+        let mut dict = Dictionary::from_str("かんじ /漢字/幹事/\n");
+        dict.add_entry(
+            "かんじ",
+            DictEntry {
+                word: "感じ".to_string(),
+                annotation: None,
+            },
+        );
+        let entries = dict.lookup("かんじ").expect("should exist");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].word, "感じ"); // 先頭に挿入
+        assert_eq!(entries[1].word, "漢字");
+        assert_eq!(entries[2].word, "幹事");
+    }
+
+    #[test]
+    fn test_add_entry_no_duplicate() {
+        let mut dict = Dictionary::from_str("かんじ /漢字/感じ/\n");
+        dict.add_entry(
+            "かんじ",
+            DictEntry {
+                word: "漢字".to_string(),
+                annotation: None,
+            },
+        );
+        let entries = dict.lookup("かんじ").expect("should exist");
+        assert_eq!(entries.len(), 2); // 重複はスキップ
+    }
+
+    #[test]
+    fn test_add_entry_okuri_ari() {
+        let mut dict = Dictionary::new();
+        dict.add_entry(
+            "おおk",
+            DictEntry {
+                word: "大".to_string(),
+                annotation: None,
+            },
+        );
+        assert!(dict.lookup_okuri_ari("おおk").is_some());
+        assert!(dict.lookup_okuri_nashi("おおk").is_none());
+    }
+
+    // === to_skk_string / roundtrip テスト ===
+
+    #[test]
+    fn test_to_skk_string_roundtrip() {
+        let mut dict = Dictionary::new();
+        dict.add_entry(
+            "かんじ",
+            DictEntry {
+                word: "漢字".to_string(),
+                annotation: None,
+            },
+        );
+        dict.add_entry(
+            "かんじ",
+            DictEntry {
+                word: "感じ".to_string(),
+                annotation: Some("feeling".to_string()),
+            },
+        );
+        let skk = dict.to_skk_string();
+        let dict2 = Dictionary::from_str(&skk);
+        let entries = dict2.lookup("かんじ").expect("should exist");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].word, "感じ");
+        assert_eq!(entries[0].annotation.as_deref(), Some("feeling"));
+        assert_eq!(entries[1].word, "漢字");
+    }
+
+    // === save テスト ===
+
+    #[test]
+    fn test_save_and_load() {
+        let dir = std::env::temp_dir().join("koyubi_test_save");
+        let path = dir.join("user-dict.skk");
+
+        let mut dict = Dictionary::new();
+        dict.add_entry(
+            "てすと",
+            DictEntry {
+                word: "テスト".to_string(),
+                annotation: None,
+            },
+        );
+        dict.save(&path).expect("save failed");
+
+        let loaded = Dictionary::load(&path).expect("load failed");
+        let entries = loaded.lookup("てすと").expect("should exist");
+        assert_eq!(entries[0].word, "テスト");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

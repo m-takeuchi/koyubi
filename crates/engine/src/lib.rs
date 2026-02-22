@@ -74,6 +74,7 @@ pub enum CompositionState {
         reading: String,
         okuri: Option<String>,
         word: String,
+        pending_roman: String,
     },
 }
 
@@ -81,6 +82,20 @@ impl Default for CompositionState {
     fn default() -> Self {
         Self::Direct
     }
+}
+
+/// 候補ウィンドウに表示する候補情報
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateDisplay {
+    pub word: String,
+    pub annotation: Option<String>,
+}
+
+/// 候補ウィンドウ表示用の状態
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateInfo {
+    pub candidates: Vec<CandidateDisplay>,
+    pub selected: usize,
 }
 
 /// キー入力に対するエンジンの応答

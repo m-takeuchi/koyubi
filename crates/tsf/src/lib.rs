@@ -1,3 +1,4 @@
+mod candidate_ui;
 mod class_factory;
 mod edit_session;
 mod globals;

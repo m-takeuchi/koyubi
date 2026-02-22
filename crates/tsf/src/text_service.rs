@@ -27,7 +27,11 @@ macro_rules! dbglog {
     }};
 }
 
-use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, LPARAM, RECT, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_SHIFT,
+};
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfEditSession,
     ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessor,
@@ -36,12 +40,13 @@ use windows::Win32::UI::TextServices::{
 use windows::core::{implement, Interface as _};
 use windows_core::{BOOL, GUID, IUnknownImpl as _};
 
+use crate::candidate_ui::CandidateWindow;
 use crate::edit_session::{
     CommitEditSession, CommitWithCompositionEditSession, CompositionEditSession,
-    EndCompositionEditSession,
+    EndCompositionEditSession, GetTextExtEditSession,
 };
 use crate::globals;
-use crate::key_event;
+use crate::key_event::{self, EmacsAction};
 
 /// Koyubi SKK Text Service
 #[implement(ITfTextInputProcessor, ITfKeyEventSink, ITfCompositionSink)]
@@ -50,6 +55,7 @@ pub struct TextService {
     client_id: Cell<u32>,
     engine: RefCell<SkkEngine>,
     composition: RefCell<Option<ITfComposition>>,
+    candidate_window: RefCell<CandidateWindow>,
 }
 
 impl TextService {
@@ -60,6 +66,7 @@ impl TextService {
             client_id: Cell::new(0),
             engine: RefCell::new(SkkEngine::new()),
             composition: RefCell::new(None),
+            candidate_window: RefCell::new(CandidateWindow::new()),
         }
     }
 
@@ -138,6 +145,53 @@ impl TextService {
         }
         Ok(())
     }
+
+    /// コンポジション位置のスクリーン座標を取得する
+    fn get_text_ext(&self, context: &ITfContext) -> Option<RECT> {
+        let comp = self.composition.borrow().clone()?;
+        let result = Rc::new(RefCell::new(None));
+        let session =
+            GetTextExtEditSession::new(context.clone(), comp, result.clone());
+        let session: ITfEditSession = session.into();
+        unsafe {
+            let _ = context.RequestEditSession(
+                self.client_id.get(),
+                &session,
+                TF_ES_SYNC | TF_ES_READWRITE,
+            );
+        }
+        let val = result.borrow().clone();
+        val
+    }
+
+    /// 候補ウィンドウの表示/非表示を同期する
+    fn sync_candidate_window(&self, context: &ITfContext) {
+        let info = self.engine.borrow().candidate_info();
+        if let Some(info) = info {
+            let rect = self.get_text_ext(context).unwrap_or(RECT {
+                left: 100,
+                top: 100,
+                right: 200,
+                bottom: 120,
+            });
+            // ページ計算: 9候補/ページ
+            let page_start = (info.selected / 9) * 9;
+            let page_end = (page_start + 9).min(info.candidates.len());
+            let page_candidates = &info.candidates[page_start..page_end];
+            let selected_in_page = info.selected - page_start;
+            let total_pages = (info.candidates.len() + 8) / 9;
+            let current_page = info.selected / 9;
+            self.candidate_window.borrow().show(
+                page_candidates,
+                selected_in_page,
+                current_page,
+                total_pages,
+                &rect,
+            );
+        } else {
+            self.candidate_window.borrow().hide();
+        }
+    }
 }
 
 impl Drop for TextService {
@@ -204,6 +258,68 @@ fn load_dictionaries(engine: &mut SkkEngine) {
     dbglog!("WARNING: No dictionary found");
 }
 
+/// ユーザー辞書パスを設定
+fn load_user_dictionary(engine: &mut SkkEngine) {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let path = PathBuf::from(appdata)
+            .join("Koyubi")
+            .join("dict")
+            .join("user-dict.skk");
+        dbglog!("User dictionary path: {:?}", path);
+        engine.set_user_dictionary(path);
+    }
+}
+
+/// SendInput 用のヘルパー: キーイベントを1つ作成
+fn ki(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+    let mut input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        ..Default::default()
+    };
+    input.Anonymous.ki = KEYBDINPUT {
+        wVk: vk,
+        dwFlags: flags,
+        ..Default::default()
+    };
+    input
+}
+
+/// 単一キーの SendInput シミュレーション
+///
+/// Ctrl が物理的に押されたままだとアプリが Ctrl+キー と解釈するため、
+/// Ctrl を一時的に離してからキーを送信し、再度 Ctrl を押す。
+fn send_simulated_key(vk: VIRTUAL_KEY) {
+    let inputs = [
+        ki(VK_CONTROL, KEYEVENTF_KEYUP),     // Ctrl を離す
+        ki(vk, KEYBD_EVENT_FLAGS(0)),          // キー押下
+        ki(vk, KEYEVENTF_KEYUP),              // キー離す
+        ki(VK_CONTROL, KEYBD_EVENT_FLAGS(0)), // Ctrl を再度押す
+    ];
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// 行末まで削除（Ctrl+K）: Shift+End で選択 → Delete で削除
+///
+/// Ctrl を離す前に Shift を押し始めることで、Ctrl→無修飾→Shift の遷移を避ける。
+/// （Windows が Ctrl UP + Shift DOWN を IME 切り替えシーケンスと誤認するのを防止）
+fn send_kill_line() {
+    let inputs = [
+        ki(VK_SHIFT, KEYBD_EVENT_FLAGS(0)),   // Shift 押す（Ctrl+Shift 状態）
+        ki(VK_CONTROL, KEYEVENTF_KEYUP),     // Ctrl を離す（Shift のみ）
+        ki(VK_END, KEYBD_EVENT_FLAGS(0)),     // End 押す（Shift+End = 行末まで選択）
+        ki(VK_END, KEYEVENTF_KEYUP),         // End 離す
+        ki(VK_SHIFT, KEYEVENTF_KEYUP),       // Shift 離す
+        ki(VK_DELETE, KEYBD_EVENT_FLAGS(0)),  // Delete 押す
+        ki(VK_DELETE, KEYEVENTF_KEYUP),      // Delete 離す
+        ki(VK_CONTROL, KEYBD_EVENT_FLAGS(0)), // Ctrl を再度押す
+    ];
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
 // =========================================================
 // ITfTextInputProcessor
 // =========================================================
@@ -231,10 +347,22 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         // 辞書読み込み
         load_dictionaries(&mut self.engine.borrow_mut());
 
+        // ユーザー辞書設定
+        load_user_dictionary(&mut self.engine.borrow_mut());
+
+        // 候補ウィンドウ作成
+        let hinstance = HINSTANCE(globals::dll_instance().0);
+        if let Err(e) = self.candidate_window.borrow().create(hinstance) {
+            dbglog!("CandidateWindow::create failed: {:?}", e);
+        }
+
         Ok(())
     }
 
     fn Deactivate(&self) -> windows::core::Result<()> {
+        // 候補ウィンドウ破棄
+        self.candidate_window.borrow().destroy();
+
         // コンポジションを破棄
         *self.composition.borrow_mut() = None;
 
@@ -294,6 +422,41 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     ) -> windows::core::Result<BOOL> {
         let context: ITfContext = pic.ok()?.clone();
 
+        let vk = wparam.0 as u16;
+
+        // Emacs キーバインド処理（エンジンの前にチェック）
+        // Ctrl+H はエンジン経由で処理するため除外（▽モードでの reading 削除等）
+        {
+            let mut kbd_state = [0u8; 256];
+            unsafe {
+                if windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardState(
+                    &mut kbd_state,
+                )
+                .is_err()
+                {
+                    kbd_state.fill(0);
+                }
+            }
+            let ctrl = kbd_state[VK_CONTROL.0 as usize] & 0x80 != 0;
+            let shift = kbd_state[VK_SHIFT.0 as usize] & 0x80 != 0;
+
+            if ctrl && !shift {
+                match key_event::emacs_action(vk) {
+                    Some(EmacsAction::SimulateKey(target)) => {
+                        dbglog!("OnKeyDown: Emacs SimulateKey vk=0x{:02X} -> target=0x{:04X}", vk, target.0);
+                        send_simulated_key(target);
+                        return Ok(BOOL(1));
+                    }
+                    Some(EmacsAction::KillLine) => {
+                        dbglog!("OnKeyDown: Emacs KillLine");
+                        send_kill_line();
+                        return Ok(BOOL(1));
+                    }
+                    None => {} // H or non-Emacs key → fall through to engine
+                }
+            }
+        }
+
         let key_event = match key_event::to_key_event(wparam, lparam) {
             Some(ev) => {
                 dbglog!("OnKeyDown: vk=0x{:02X} -> {:?}", wparam.0, ev);
@@ -309,7 +472,17 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         dbglog!("OnKeyDown: response={:?}", response);
 
         match response {
-            EngineResponse::PassThrough => return Ok(BOOL(0)),
+            EngineResponse::PassThrough => {
+                // Ctrl+H: エンジンが PassThrough を返した場合、VK_BACK をシミュレート
+                // (wparam=0x48 は should_eat_key で消費済みなのでアプリには届かない。
+                //  代わりに VK_BACK を送信してバックスペースとして機能させる)
+                if vk == 0x48 {
+                    dbglog!("OnKeyDown: Ctrl+H PassThrough -> simulate VK_BACK");
+                    send_simulated_key(VK_BACK);
+                    return Ok(BOOL(1));
+                }
+                return Ok(BOOL(0));
+            }
             EngineResponse::Commit(text) => {
                 self.do_commit_text(&context, &text)?;
             }
@@ -326,6 +499,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         } else if self.composition.borrow().is_some() {
             self.do_end_composition(&context)?;
         }
+
+        // 候補ウィンドウの表示/非表示を同期
+        self.sync_candidate_window(&context);
 
         Ok(BOOL(1))
     }
@@ -362,6 +538,7 @@ impl ITfCompositionSink_Impl for TextService_Impl {
         // エンジン状態をリセットし、コンポジション参照をクリア
         self.engine.borrow_mut().reset_state();
         *self.composition.borrow_mut() = None;
+        self.candidate_window.borrow().hide();
         Ok(())
     }
 }
