@@ -55,7 +55,7 @@ pub fn register() -> Result<()> {
             LANGID_JA,
             &GUID_KOYUBI_PROFILE,
             &desc,
-            &dll_path,
+            &[],  // アイコンは ITfLangBarItemButton::GetIcon で提供
             0,
         )?;
     }

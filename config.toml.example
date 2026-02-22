@@ -1,0 +1,36 @@
+# Koyubi SKK 設定ファイル
+# %APPDATA%\Koyubi\config.toml
+
+# SandS (Space and Shift) 機能
+# Space を押しながら他のキー → Shift として動作
+# Space 単独タップ → 通常の Space
+sands_enabled = true
+
+# Emacs キーバインド (Ctrl+F/B/A/E/N/P/D/K)
+# 無効にするとこれらのキーはアプリにそのまま渡される
+# Ctrl+H → Backspace はこの設定に関係なく常に有効
+emacs_bindings_enabled = true
+
+# システム辞書パス（複数指定可）
+# 空の場合は DLL 同梱 → ワークスペース → %APPDATA% の順で自動検出
+system_dict_paths = []
+
+# ユーザー辞書パス
+# 未指定の場合は %APPDATA%\Koyubi\dict\user-dict.skk
+# user_dict_path = "C:\\Users\\username\\AppData\\Roaming\\Koyubi\\dict\\user-dict.skk"
+
+# カタカナ切替キー
+toggle_kana = "q"
+
+# ASCII モード切替キー
+enter_ascii = "l"
+
+# 全角英数モード切替キー
+enter_zenkaku = "L"
+
+# 前候補キー
+prev_candidate = "x"
+
+# 起動時の入力モード
+# ascii / hiragana / katakana / hankaku_katakana / zenkaku_ascii
+initial_mode = "ascii"

@@ -3,6 +3,7 @@ mod class_factory;
 mod edit_session;
 mod globals;
 mod key_event;
+mod lang_bar;
 mod register;
 mod text_service;
 

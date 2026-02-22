@@ -17,6 +17,10 @@ pub const CLSID_KOYUBI_TEXT_SERVICE: GUID =
 pub const GUID_KOYUBI_PROFILE: GUID =
     GUID::from_u128(0xb8c4d5e6_f708_4901_bc23_de45f0678901);
 
+/// LangBar ボタン GUID
+pub const GUID_LANGBAR_ITEM_BUTTON: GUID =
+    GUID::from_u128(0xc9d5e6f7_0819_4a12_cd34_ef5678901234);
+
 /// 日本語 LANGID (0x0411)
 pub const LANGID_JA: u16 = 0x0411;
 

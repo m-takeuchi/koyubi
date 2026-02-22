@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use koyubi_engine::composer::SkkEngine;
+use koyubi_engine::config::Config;
 use koyubi_engine::dict::Dictionary;
-use koyubi_engine::EngineResponse;
+use koyubi_engine::{EngineResponse, InputMode};
 
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 
@@ -29,16 +30,18 @@ macro_rules! dbglog {
 
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_SHIFT,
+    GetKeyboardState, SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_END, VK_MENU, VK_SHIFT,
+    VK_SPACE,
 };
+use windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo;
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfEditSession,
-    ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessor,
-    ITfTextInputProcessor_Impl, ITfThreadMgr, TF_ES_READWRITE, TF_ES_SYNC,
+    ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfLangBarItemButton,
+    ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr, TF_ES_READWRITE, TF_ES_SYNC,
 };
 use windows::core::{implement, Interface as _};
-use windows_core::{BOOL, GUID, IUnknownImpl as _};
+use windows_core::{AsImpl as _, BOOL, GUID, IUnknownImpl as _};
 
 use crate::candidate_ui::CandidateWindow;
 use crate::edit_session::{
@@ -47,6 +50,21 @@ use crate::edit_session::{
 };
 use crate::globals;
 use crate::key_event::{self, EmacsAction};
+use crate::lang_bar::{self, LangBarButton};
+
+/// SandS (Space and Shift) の状態
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandsState {
+    /// Space 非押下
+    Idle,
+    /// Space 押下、他キーまだなし
+    SpaceDown,
+    /// Space+他キーが発生 → Space は Shift として使用中
+    ShiftActive,
+}
+
+/// SendInput で注入したキーを識別するためのタグ（"KYUB"）
+const SANDS_INJECTED: usize = 0x4B595542;
 
 /// Koyubi SKK Text Service
 #[implement(ITfTextInputProcessor, ITfKeyEventSink, ITfCompositionSink)]
@@ -56,6 +74,8 @@ pub struct TextService {
     engine: RefCell<SkkEngine>,
     composition: RefCell<Option<ITfComposition>>,
     candidate_window: RefCell<CandidateWindow>,
+    lang_bar_button: RefCell<Option<ITfLangBarItemButton>>,
+    sands_state: Cell<SandsState>,
 }
 
 impl TextService {
@@ -64,9 +84,11 @@ impl TextService {
         Self {
             thread_mgr: RefCell::new(None),
             client_id: Cell::new(0),
-            engine: RefCell::new(SkkEngine::new()),
+            engine: RefCell::new(SkkEngine::default()),
             composition: RefCell::new(None),
             candidate_window: RefCell::new(CandidateWindow::new()),
+            lang_bar_button: RefCell::new(None),
+            sands_state: Cell::new(SandsState::Idle),
         }
     }
 
@@ -164,6 +186,116 @@ impl TextService {
         val
     }
 
+    /// エンジンのレスポンスを処理し、TSF 状態を同期する
+    ///
+    /// `comp_sink` は TSF コンポジション更新に必要。呼び出し元で `self.to_interface()` して渡す。
+    fn handle_engine_response(
+        &self,
+        context: &ITfContext,
+        response: EngineResponse,
+        vk: u16,
+        comp_sink: ITfCompositionSink,
+    ) -> windows::core::Result<BOOL> {
+        match response {
+            EngineResponse::PassThrough => {
+                // Ctrl+H: エンジンが PassThrough を返した場合、VK_BACK をシミュレート
+                if vk == 0x48 {
+                    dbglog!("handle_engine_response: Ctrl+H PassThrough -> simulate VK_BACK");
+                    send_simulated_key(VK_BACK);
+                    return Ok(BOOL(1));
+                }
+                return Ok(BOOL(0));
+            }
+            EngineResponse::Commit(text) => {
+                self.do_commit_text(context, &text)?;
+            }
+            EngineResponse::UpdateComposition { .. } | EngineResponse::Consumed => {
+                // Handled by sync below
+            }
+        }
+
+        // TSF コンポジション状態をエンジン状態と同期
+        let comp_text = self.engine.borrow().composition_text();
+        if let Some(text) = comp_text {
+            self.do_update_composition(context, &text, comp_sink)?;
+        } else if self.composition.borrow().is_some() {
+            self.do_end_composition(context)?;
+        }
+
+        // 候補ウィンドウの表示/非表示を同期
+        self.sync_candidate_window(context);
+
+        // 言語バーにモード変更を通知
+        self.notify_mode_change();
+
+        Ok(BOOL(1))
+    }
+
+    /// 通常のキー処理パス（Emacs キーバインド + エンジン）
+    fn process_key_normal(
+        &self,
+        context: &ITfContext,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        comp_sink: ITfCompositionSink,
+    ) -> windows::core::Result<BOOL> {
+        let vk = wparam.0 as u16;
+
+        // Emacs キーバインド処理（エンジンの前にチェック）
+        // Ctrl+H はエンジン経由で処理するため除外
+        if self.engine.borrow().config().emacs_bindings_enabled {
+            let mut kbd_state = [0u8; 256];
+            unsafe {
+                if GetKeyboardState(&mut kbd_state).is_err() {
+                    kbd_state.fill(0);
+                }
+            }
+            let ctrl = kbd_state[VK_CONTROL.0 as usize] & 0x80 != 0;
+            let shift = kbd_state[VK_SHIFT.0 as usize] & 0x80 != 0;
+
+            if ctrl && !shift {
+                match key_event::emacs_action(vk) {
+                    Some(EmacsAction::SimulateKey(target)) => {
+                        dbglog!("process_key_normal: Emacs SimulateKey vk=0x{:02X} -> target=0x{:04X}", vk, target.0);
+                        send_simulated_key(target);
+                        return Ok(BOOL(1));
+                    }
+                    Some(EmacsAction::KillLine) => {
+                        dbglog!("process_key_normal: Emacs KillLine");
+                        send_kill_line();
+                        return Ok(BOOL(1));
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        let key_event = match key_event::to_key_event(wparam, lparam) {
+            Some(ev) => {
+                dbglog!("process_key_normal: vk=0x{:02X} -> {:?}", wparam.0, ev);
+                ev
+            }
+            None => {
+                dbglog!("process_key_normal: vk=0x{:02X} -> None (ignored)", wparam.0);
+                return Ok(BOOL(0));
+            }
+        };
+
+        let response = self.engine.borrow_mut().process_key(key_event);
+        dbglog!("process_key_normal: response={:?}", response);
+
+        self.handle_engine_response(context, response, vk, comp_sink)
+    }
+
+    /// 言語バーボタンにモード変更を通知する
+    fn notify_mode_change(&self) {
+        if let Some(ref button) = *self.lang_bar_button.borrow() {
+            let mode = self.engine.borrow().current_mode();
+            let impl_ref: &LangBarButton = unsafe { button.as_impl() };
+            impl_ref.update_mode(mode);
+        }
+    }
+
     /// 候補ウィンドウの表示/非表示を同期する
     fn sync_candidate_window(&self, context: &ITfContext) {
         let info = self.engine.borrow().candidate_info();
@@ -214,6 +346,29 @@ fn get_dll_directory() -> Option<PathBuf> {
 
 /// 辞書を検索パスから読み込む
 fn load_dictionaries(engine: &mut SkkEngine) {
+    // config で明示的にパスが指定されている場合はそれを使用
+    let config_paths = engine.config().system_dict_paths.clone();
+    if !config_paths.is_empty() {
+        for path_str in &config_paths {
+            let path = PathBuf::from(path_str);
+            match Dictionary::load(&path) {
+                Ok(dict) => {
+                    dbglog!(
+                        "Dictionary loaded (config): {:?} ({} entries)",
+                        path,
+                        dict.entry_count()
+                    );
+                    engine.add_dictionary(dict);
+                }
+                Err(e) => {
+                    dbglog!("Dictionary not found (config): {:?} ({:?})", path, e);
+                }
+            }
+        }
+        return;
+    }
+
+    // 自動検出
     let mut search_paths = Vec::new();
 
     // 1. DLL と同じディレクトリ
@@ -260,14 +415,18 @@ fn load_dictionaries(engine: &mut SkkEngine) {
 
 /// ユーザー辞書パスを設定
 fn load_user_dictionary(engine: &mut SkkEngine) {
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let path = PathBuf::from(appdata)
+    let path = if let Some(ref user_path) = engine.config().user_dict_path {
+        PathBuf::from(user_path)
+    } else if let Ok(appdata) = std::env::var("APPDATA") {
+        PathBuf::from(appdata)
             .join("Koyubi")
             .join("dict")
-            .join("user-dict.skk");
-        dbglog!("User dictionary path: {:?}", path);
-        engine.set_user_dictionary(path);
-    }
+            .join("user-dict.skk")
+    } else {
+        return;
+    };
+    dbglog!("User dictionary path: {:?}", path);
+    engine.set_user_dictionary(path);
 }
 
 /// SendInput 用のヘルパー: キーイベントを1つ作成
@@ -320,6 +479,47 @@ fn send_kill_line() {
     }
 }
 
+/// SendInput 用のヘルパー: dwExtraInfo にタグを付与したキーイベント
+///
+/// SandS が注入したキーが TSF に再到達したとき、タグで識別してスルーさせる。
+fn ki_tagged(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+    let mut input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        ..Default::default()
+    };
+    input.Anonymous.ki = KEYBDINPUT {
+        wVk: vk,
+        dwFlags: flags,
+        dwExtraInfo: SANDS_INJECTED,
+        ..Default::default()
+    };
+    input
+}
+
+/// SandS: Shift+key を SendInput で注入する（Ascii モード用）
+fn send_shifted_key(vk: VIRTUAL_KEY) {
+    let inputs = [
+        ki_tagged(VK_SHIFT, KEYBD_EVENT_FLAGS(0)),  // Shift 押下
+        ki_tagged(vk, KEYBD_EVENT_FLAGS(0)),         // キー押下
+        ki_tagged(vk, KEYEVENTF_KEYUP),              // キー離す
+        ki_tagged(VK_SHIFT, KEYEVENTF_KEYUP),        // Shift 離す
+    ];
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// SandS: Space タップを SendInput で注入する（Ascii モード用）
+fn send_space() {
+    let inputs = [
+        ki_tagged(VK_SPACE, KEYBD_EVENT_FLAGS(0)),   // Space 押下
+        ki_tagged(VK_SPACE, KEYEVENTF_KEYUP),        // Space 離す
+    ];
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
 // =========================================================
 // ITfTextInputProcessor
 // =========================================================
@@ -344,6 +544,19 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         *self.thread_mgr.borrow_mut() = Some(thread_mgr);
         self.client_id.set(tid);
 
+        // 設定ファイル読み込み
+        let config = if let Ok(appdata) = std::env::var("APPDATA") {
+            let config_path = PathBuf::from(&appdata).join("Koyubi").join("config.toml");
+            dbglog!("Loading config from: {:?}", config_path);
+            Config::load(&config_path)
+        } else {
+            dbglog!("APPDATA not set, using default config");
+            Config::default()
+        };
+        dbglog!("Config: sands={}, emacs={}, initial_mode={:?}",
+            config.sands_enabled, config.emacs_bindings_enabled, config.initial_mode);
+        *self.engine.borrow_mut() = SkkEngine::new(config);
+
         // 辞書読み込み
         load_dictionaries(&mut self.engine.borrow_mut());
 
@@ -356,12 +569,32 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             dbglog!("CandidateWindow::create failed: {:?}", e);
         }
 
+        // 言語バーボタン登録
+        let button = LangBarButton::new();
+        let button_iface: ITfLangBarItemButton = button.into();
+        if let Some(ref tm) = *self.thread_mgr.borrow() {
+            let impl_ref: &LangBarButton = unsafe { button_iface.as_impl() };
+            if let Err(e) = lang_bar::add_to_lang_bar(tm, &button_iface) {
+                dbglog!("LangBarButton::add_to_lang_bar failed: {:?}", e);
+            }
+            impl_ref.update_mode(self.engine.borrow().current_mode());
+        }
+        *self.lang_bar_button.borrow_mut() = Some(button_iface);
+
         Ok(())
     }
 
     fn Deactivate(&self) -> windows::core::Result<()> {
         // 候補ウィンドウ破棄
         self.candidate_window.borrow().destroy();
+
+        // 言語バーボタン削除
+        if let Some(ref button) = *self.lang_bar_button.borrow() {
+            if let Some(ref thread_mgr) = *self.thread_mgr.borrow() {
+                let _ = lang_bar::remove_from_lang_bar(thread_mgr, button);
+            }
+        }
+        *self.lang_bar_button.borrow_mut() = None;
 
         // コンポジションを破棄
         *self.composition.borrow_mut() = None;
@@ -378,6 +611,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
 
         // エンジン状態リセット
         self.engine.borrow_mut().reset_state();
+        self.sands_state.set(SandsState::Idle);
 
         *self.thread_mgr.borrow_mut() = None;
         self.client_id.set(0);
@@ -400,6 +634,53 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
+        let vk = wparam.0 as u16;
+        let sands_enabled = self.engine.borrow().config().sands_enabled;
+
+        // SandS が注入したキーはスルー
+        if sands_enabled && unsafe { GetMessageExtraInfo() }.0 as usize == SANDS_INJECTED {
+            dbglog!("OnTestKeyDown: vk=0x{:02X} SANDS_INJECTED -> pass", vk);
+            return Ok(BOOL(0));
+        }
+
+        // Space キー（Ctrl なし）→ SandS で消費
+        if sands_enabled && vk == VK_SPACE.0 {
+            let mut kbd_state = [0u8; 256];
+            unsafe {
+                if GetKeyboardState(&mut kbd_state).is_err() {
+                    kbd_state.fill(0);
+                }
+            }
+            let ctrl = kbd_state[VK_CONTROL.0 as usize] & 0x80 != 0;
+            if !ctrl {
+                dbglog!("OnTestKeyDown: Space (SandS) -> eat");
+                return Ok(BOOL(1));
+            }
+        }
+
+        // SandS が SpaceDown/ShiftActive のとき、非修飾キーを消費
+        if sands_enabled {
+            let sands = self.sands_state.get();
+            if sands == SandsState::SpaceDown || sands == SandsState::ShiftActive {
+                // 修飾キー単体は除外
+                if vk != VK_SHIFT.0 && vk != VK_CONTROL.0 && vk != VK_MENU.0 {
+                    let mut kbd_state = [0u8; 256];
+                    unsafe {
+                        if GetKeyboardState(&mut kbd_state).is_err() {
+                            kbd_state.fill(0);
+                        }
+                    }
+                    let ctrl = kbd_state[VK_CONTROL.0 as usize] & 0x80 != 0;
+                    let alt = kbd_state[VK_MENU.0 as usize] & 0x80 != 0;
+                    if !ctrl && !alt {
+                        dbglog!("OnTestKeyDown: vk=0x{:02X} SandS {:?} -> eat", vk, sands);
+                        return Ok(BOOL(1));
+                    }
+                }
+            }
+        }
+
+        // 通常の判定
         let eat = key_event::should_eat_key(wparam, lparam, &self.engine.borrow());
         dbglog!("OnTestKeyDown: vk=0x{:02X} eat={} mode={:?}", wparam.0, eat, self.engine.borrow().current_mode());
         Ok(BOOL(eat as i32))
@@ -408,9 +689,20 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     fn OnTestKeyUp(
         &self,
         _pic: windows::core::Ref<'_, ITfContext>,
-        _wparam: WPARAM,
+        wparam: WPARAM,
         _lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
+        let vk = wparam.0 as u16;
+
+        // Space up + SandS 状態 → 消費
+        if self.engine.borrow().config().sands_enabled && vk == VK_SPACE.0 {
+            let sands = self.sands_state.get();
+            if sands == SandsState::SpaceDown || sands == SandsState::ShiftActive {
+                dbglog!("OnTestKeyUp: Space SandS {:?} -> eat", sands);
+                return Ok(BOOL(1));
+            }
+        }
+
         Ok(BOOL(0))
     }
 
@@ -421,97 +713,131 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
         let context: ITfContext = pic.ok()?.clone();
-
         let vk = wparam.0 as u16;
+        let sands_enabled = self.engine.borrow().config().sands_enabled;
 
-        // Emacs キーバインド処理（エンジンの前にチェック）
-        // Ctrl+H はエンジン経由で処理するため除外（▽モードでの reading 削除等）
-        {
+        // SandS が注入したキーはスルー
+        if sands_enabled && unsafe { GetMessageExtraInfo() }.0 as usize == SANDS_INJECTED {
+            dbglog!("OnKeyDown: vk=0x{:02X} SANDS_INJECTED -> pass", vk);
+            return Ok(BOOL(0));
+        }
+
+        // Space キー（Ctrl なし）→ SandS 状態遷移
+        if sands_enabled && vk == VK_SPACE.0 {
             let mut kbd_state = [0u8; 256];
             unsafe {
-                if windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardState(
-                    &mut kbd_state,
-                )
-                .is_err()
-                {
+                if GetKeyboardState(&mut kbd_state).is_err() {
                     kbd_state.fill(0);
                 }
             }
             let ctrl = kbd_state[VK_CONTROL.0 as usize] & 0x80 != 0;
-            let shift = kbd_state[VK_SHIFT.0 as usize] & 0x80 != 0;
-
-            if ctrl && !shift {
-                match key_event::emacs_action(vk) {
-                    Some(EmacsAction::SimulateKey(target)) => {
-                        dbglog!("OnKeyDown: Emacs SimulateKey vk=0x{:02X} -> target=0x{:04X}", vk, target.0);
-                        send_simulated_key(target);
-                        return Ok(BOOL(1));
-                    }
-                    Some(EmacsAction::KillLine) => {
-                        dbglog!("OnKeyDown: Emacs KillLine");
-                        send_kill_line();
-                        return Ok(BOOL(1));
-                    }
-                    None => {} // H or non-Emacs key → fall through to engine
-                }
-            }
-        }
-
-        let key_event = match key_event::to_key_event(wparam, lparam) {
-            Some(ev) => {
-                dbglog!("OnKeyDown: vk=0x{:02X} -> {:?}", wparam.0, ev);
-                ev
-            }
-            None => {
-                dbglog!("OnKeyDown: vk=0x{:02X} -> None (ignored)", wparam.0);
-                return Ok(BOOL(0));
-            }
-        };
-
-        let response = self.engine.borrow_mut().process_key(key_event);
-        dbglog!("OnKeyDown: response={:?}", response);
-
-        match response {
-            EngineResponse::PassThrough => {
-                // Ctrl+H: エンジンが PassThrough を返した場合、VK_BACK をシミュレート
-                // (wparam=0x48 は should_eat_key で消費済みなのでアプリには届かない。
-                //  代わりに VK_BACK を送信してバックスペースとして機能させる)
-                if vk == 0x48 {
-                    dbglog!("OnKeyDown: Ctrl+H PassThrough -> simulate VK_BACK");
-                    send_simulated_key(VK_BACK);
+            if !ctrl {
+                let is_repeat = (lparam.0 >> 30) & 1 != 0;
+                if is_repeat {
+                    // リピートは無視
+                    dbglog!("OnKeyDown: Space repeat -> ignore");
                     return Ok(BOOL(1));
                 }
-                return Ok(BOOL(0));
-            }
-            EngineResponse::Commit(text) => {
-                self.do_commit_text(&context, &text)?;
-            }
-            EngineResponse::UpdateComposition { .. } | EngineResponse::Consumed => {
-                // Handled by sync below
+                dbglog!("OnKeyDown: Space -> SandS SpaceDown");
+                self.sands_state.set(SandsState::SpaceDown);
+                return Ok(BOOL(1));
             }
         }
 
-        // TSF コンポジション状態をエンジン状態と同期
-        let comp_text = self.engine.borrow().composition_text();
-        if let Some(text) = comp_text {
-            let sink: ITfCompositionSink = self.to_interface();
-            self.do_update_composition(&context, &text, sink)?;
-        } else if self.composition.borrow().is_some() {
-            self.do_end_composition(&context)?;
+        // SandS が SpaceDown/ShiftActive のとき、非修飾キーを Shift 付きで処理
+        let sands = self.sands_state.get();
+        if sands_enabled && (sands == SandsState::SpaceDown || sands == SandsState::ShiftActive) {
+            if vk != VK_SHIFT.0 && vk != VK_CONTROL.0 && vk != VK_MENU.0 {
+                let mut kbd_state = [0u8; 256];
+                unsafe {
+                    if GetKeyboardState(&mut kbd_state).is_err() {
+                        kbd_state.fill(0);
+                    }
+                }
+                let ctrl = kbd_state[VK_CONTROL.0 as usize] & 0x80 != 0;
+                let alt = kbd_state[VK_MENU.0 as usize] & 0x80 != 0;
+                if !ctrl && !alt {
+                    self.sands_state.set(SandsState::ShiftActive);
+                    dbglog!("OnKeyDown: vk=0x{:02X} SandS -> ShiftActive", vk);
+
+                    // Ascii モード → SendInput で Shift+key を注入
+                    if self.engine.borrow().current_mode() == InputMode::Ascii {
+                        dbglog!("OnKeyDown: SandS Ascii -> send_shifted_key(0x{:02X})", vk);
+                        send_shifted_key(VIRTUAL_KEY(vk));
+                        return Ok(BOOL(1));
+                    }
+
+                    // 非 Ascii → Shift 強制でエンジンに渡す
+                    let key_event = match key_event::to_key_event_with_forced_shift(wparam, lparam) {
+                        Some(ev) => {
+                            dbglog!("OnKeyDown: SandS forced shift -> {:?}", ev);
+                            ev
+                        }
+                        None => {
+                            dbglog!("OnKeyDown: SandS forced shift -> None (ignored)");
+                            return Ok(BOOL(0));
+                        }
+                    };
+
+                    let response = self.engine.borrow_mut().process_key(key_event);
+                    dbglog!("OnKeyDown: SandS response={:?}", response);
+                    let sink: ITfCompositionSink = self.to_interface();
+                    return self.handle_engine_response(&context, response, vk, sink);
+                }
+            }
         }
 
-        // 候補ウィンドウの表示/非表示を同期
-        self.sync_candidate_window(&context);
-
-        Ok(BOOL(1))
+        // 通常のキー処理
+        let sink: ITfCompositionSink = self.to_interface();
+        self.process_key_normal(&context, wparam, lparam, sink)
     }
 
     fn OnKeyUp(
         &self,
-        _pic: windows::core::Ref<'_, ITfContext>,
-        _wparam: WPARAM,
+        pic: windows::core::Ref<'_, ITfContext>,
+        wparam: WPARAM,
         _lparam: LPARAM,
     ) -> windows::core::Result<BOOL> {
+        let vk = wparam.0 as u16;
+
+        if self.engine.borrow().config().sands_enabled && vk == VK_SPACE.0 {
+            let sands = self.sands_state.get();
+            match sands {
+                SandsState::SpaceDown => {
+                    // Space タップ: 他キーなしで Space を離した
+                    self.sands_state.set(SandsState::Idle);
+                    dbglog!("OnKeyUp: Space tap (SpaceDown -> Idle)");
+
+                    // Ascii モード → SendInput で Space を注入
+                    if self.engine.borrow().current_mode() == InputMode::Ascii {
+                        dbglog!("OnKeyUp: SandS Ascii -> send_space()");
+                        send_space();
+                        return Ok(BOOL(1));
+                    }
+
+                    // 非 Ascii → エンジンに Space を渡す
+                    let context: ITfContext = pic.ok()?.clone();
+                    let key_event = koyubi_engine::KeyEvent {
+                        key: koyubi_engine::Key::Space,
+                        shift: false,
+                        ctrl: false,
+                        alt: false,
+                    };
+                    let response = self.engine.borrow_mut().process_key(key_event);
+                    dbglog!("OnKeyUp: Space tap response={:?}", response);
+                    let sink: ITfCompositionSink = self.to_interface();
+                    return self.handle_engine_response(&context, response, VK_SPACE.0, sink);
+                }
+                SandsState::ShiftActive => {
+                    // Space+他キーが発生した後の Space up → 抑制
+                    self.sands_state.set(SandsState::Idle);
+                    dbglog!("OnKeyUp: Space (ShiftActive -> Idle), suppress");
+                    return Ok(BOOL(1));
+                }
+                SandsState::Idle => {}
+            }
+        }
+
         Ok(BOOL(0))
     }
 
@@ -537,6 +863,7 @@ impl ITfCompositionSink_Impl for TextService_Impl {
         // TSF がコンポジションを強制終了した場合（フォーカス移動等）
         // エンジン状態をリセットし、コンポジション参照をクリア
         self.engine.borrow_mut().reset_state();
+        self.sands_state.set(SandsState::Idle);
         *self.composition.borrow_mut() = None;
         self.candidate_window.borrow().hide();
         Ok(())

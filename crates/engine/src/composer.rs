@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use crate::config::Config;
 use crate::dict::{DictEntry, Dictionary};
 use crate::romaji::{RomajiConverter, RomajiTable};
 use crate::{
@@ -22,6 +23,7 @@ struct SavedRegistration {
 
 /// SKK 変換エンジン
 pub struct SkkEngine {
+    config: Config,
     input_mode: InputMode,
     composition: CompositionState,
     romaji: RomajiConverter,
@@ -42,10 +44,12 @@ pub struct SkkEngine {
 }
 
 impl SkkEngine {
-    /// 新しいエンジンを生成（ASCII モード、辞書なし）
-    pub fn new() -> Self {
+    /// 設定を指定してエンジンを生成
+    pub fn new(config: Config) -> Self {
+        let initial_mode = config.initial_mode;
         Self {
-            input_mode: InputMode::Ascii,
+            config,
+            input_mode: initial_mode,
             composition: CompositionState::Direct,
             romaji: RomajiConverter::new(),
             romaji_table: RomajiTable::default_table(),
@@ -57,6 +61,11 @@ impl SkkEngine {
             saved_registration: None,
             registration_sub_mode: None,
         }
+    }
+
+    /// 設定への参照を取得
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// 辞書を追加
@@ -297,8 +306,8 @@ impl SkkEngine {
         }
 
         match &key.key {
-            // l: ASCII モード
-            Key::Char('l') if !key.shift => {
+            // enter_ascii: ASCII モード
+            Key::Char(ch) if !key.shift && *ch == self.config.enter_ascii => {
                 let flushed = self.romaji.flush();
                 let flushed = self.kana_output(flushed);
                 self.input_mode = InputMode::Ascii;
@@ -309,8 +318,8 @@ impl SkkEngine {
                 }
             }
 
-            // L (Shift-l): 全角英数モード（▽モード開始より優先）
-            Key::Char('L') if key.shift => {
+            // enter_zenkaku: 全角英数モード（▽モード開始より優先）
+            Key::Char(ch) if key.shift && *ch == self.config.enter_zenkaku => {
                 let flushed = self.romaji.flush();
                 let flushed = self.kana_output(flushed);
                 self.input_mode = InputMode::ZenkakuAscii;
@@ -321,8 +330,8 @@ impl SkkEngine {
                 }
             }
 
-            // q: ひらがな/カタカナモード切替
-            Key::Char('q') if !key.shift && !key.ctrl => {
+            // toggle_kana: ひらがな/カタカナモード切替
+            Key::Char(ch) if !key.shift && !key.ctrl && *ch == self.config.toggle_kana => {
                 let flushed = self.romaji.flush();
                 let flushed = self.kana_output(flushed);
                 self.input_mode = if self.input_mode == InputMode::Hiragana {
@@ -435,8 +444,8 @@ impl SkkEngine {
             return self.start_conversion();
         }
 
-        // q: カタカナ変換
-        if !key.ctrl && !key.shift && key.key == Key::Char('q') {
+        // toggle_kana: カタカナ変換
+        if !key.ctrl && !key.shift && key.key == Key::Char(self.config.toggle_kana) {
             return self.convert_to_katakana();
         }
 
@@ -651,8 +660,8 @@ impl SkkEngine {
             // Space: 次候補
             Key::Space => self.next_candidate(),
 
-            // x: 前候補
-            Key::Char('x') if !key.ctrl && !key.shift => self.prev_candidate(),
+            // prev_candidate: 前候補
+            Key::Char(ch) if !key.ctrl && !key.shift && *ch == self.config.prev_candidate => self.prev_candidate(),
 
             // Enter: 確定
             Key::Enter => self.confirm_candidate(),
@@ -843,13 +852,13 @@ impl SkkEngine {
         }
 
         match &key.key {
-            // l: ASCII モードへ
-            Key::Char('l') if !key.shift => {
+            // enter_ascii: ASCII モードへ
+            Key::Char(ch) if !key.shift && *ch == self.config.enter_ascii => {
                 self.input_mode = InputMode::Ascii;
                 EngineResponse::Consumed
             }
-            // q: ひらがなモードへ
-            Key::Char('q') if !key.shift => {
+            // toggle_kana: ひらがなモードへ
+            Key::Char(ch) if !key.shift && *ch == self.config.toggle_kana => {
                 self.input_mode = InputMode::Hiragana;
                 EngineResponse::Consumed
             }
@@ -889,8 +898,8 @@ impl SkkEngine {
             return self.registration_backspace();
         }
 
-        // l: ASCII リテラル入力サブモード開始
-        if !key.shift && !key.ctrl && key.key == Key::Char('l') {
+        // enter_ascii: ASCII リテラル入力サブモード開始
+        if !key.shift && !key.ctrl && key.key == Key::Char(self.config.enter_ascii) {
             self.romaji.clear();
             if let CompositionState::Registration { pending_roman, .. } = &mut self.composition {
                 *pending_roman = String::new();
@@ -899,8 +908,8 @@ impl SkkEngine {
             return self.make_composition_response();
         }
 
-        // L (Shift-l): 全角英数リテラル入力サブモード開始
-        if key.shift && key.key == Key::Char('L') {
+        // enter_zenkaku: 全角英数リテラル入力サブモード開始
+        if key.shift && key.key == Key::Char(self.config.enter_zenkaku) {
             self.romaji.clear();
             if let CompositionState::Registration { pending_roman, .. } = &mut self.composition {
                 *pending_roman = String::new();
@@ -1082,6 +1091,7 @@ impl SkkEngine {
     fn cancel_registration(&mut self) -> EngineResponse {
         self.romaji.clear();
         self.registration_sub_mode = None;
+        self.saved_registration = None;
         if let CompositionState::Registration { reading, .. } = &self.composition {
             let reading = reading.clone();
             self.composition = CompositionState::PreComposition {
@@ -1244,7 +1254,7 @@ impl SkkEngine {
 
 impl Default for SkkEngine {
     fn default() -> Self {
-        Self::new()
+        Self::new(Config::default())
     }
 }
 
@@ -1353,7 +1363,7 @@ mod tests {
     }
 
     fn hiragana_engine() -> SkkEngine {
-        let mut engine = SkkEngine::new();
+        let mut engine = SkkEngine::default();
         engine.input_mode = InputMode::Hiragana;
         engine
     }
@@ -1383,7 +1393,7 @@ mod tests {
 
     #[test]
     fn test_ctrl_space_toggle() {
-        let mut engine = SkkEngine::new();
+        let mut engine = SkkEngine::default();
         assert_eq!(engine.current_mode(), InputMode::Ascii);
 
         assert_eq!(engine.process_key(ctrl_space()), EngineResponse::Consumed);
@@ -1395,7 +1405,7 @@ mod tests {
 
     #[test]
     fn test_ctrl_j_ime_on() {
-        let mut engine = SkkEngine::new();
+        let mut engine = SkkEngine::default();
         assert_eq!(engine.process_key(ctrl_key('j')), EngineResponse::Consumed);
         assert_eq!(engine.current_mode(), InputMode::Hiragana);
     }
@@ -1411,7 +1421,7 @@ mod tests {
 
     #[test]
     fn test_ascii_passthrough() {
-        let mut engine = SkkEngine::new();
+        let mut engine = SkkEngine::default();
         assert_eq!(engine.process_key(key('a')), EngineResponse::PassThrough);
         assert_eq!(engine.process_key(space()), EngineResponse::PassThrough);
         assert_eq!(engine.process_key(enter()), EngineResponse::PassThrough);
@@ -1521,7 +1531,7 @@ mod tests {
     // === カタカナモードテスト ===
 
     fn katakana_engine() -> SkkEngine {
-        let mut engine = SkkEngine::new();
+        let mut engine = SkkEngine::default();
         engine.input_mode = InputMode::Katakana;
         engine
     }
@@ -1628,7 +1638,7 @@ mod tests {
     // === ZenkakuAscii モードテスト ===
 
     fn zenkaku_engine() -> SkkEngine {
-        let mut engine = SkkEngine::new();
+        let mut engine = SkkEngine::default();
         engine.input_mode = InputMode::ZenkakuAscii;
         engine
     }
@@ -2262,7 +2272,7 @@ mod tests {
     #[test]
     fn test_full_workflow_toukyou() {
         // ASCII モードから開始して Ctrl-Space で IME ON
-        let mut engine = SkkEngine::new();
+        let mut engine = SkkEngine::default();
         engine.add_dictionary(test_dict());
 
         engine.process_key(ctrl_space());
@@ -2710,6 +2720,39 @@ mod tests {
         assert_eq!(
             engine.composition_text(),
             Some("▽かんじ[登録:っっ]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_registration_cancel_clears_saved() {
+        // ネスト変換後に登録キャンセル → saved_registration がクリアされ
+        // [登録:よみ] がバッファに残らない
+        let mut engine = engine_with_dict();
+        engine.process_key(shift_key('Z'));
+        engine.process_key(key('z'));
+        engine.process_key(key('z'));
+        engine.process_key(space()); // 候補なし → 登録モード
+
+        // ネスト変換を開始して戻す
+        engine.process_key(shift_key('K'));
+        engine.process_key(key('a'));
+        engine.process_key(escape()); // ネスト▽キャンセル → 登録モードに復帰
+
+        assert!(matches!(
+            engine.composition,
+            CompositionState::Registration { .. }
+        ));
+
+        // 登録モードをキャンセル → ▽モードに戻る
+        engine.process_key(escape());
+        assert!(matches!(
+            engine.composition,
+            CompositionState::PreComposition { .. }
+        ));
+        // [登録:っっ] が残らないことを確認
+        assert_eq!(
+            engine.composition_text(),
+            Some("▽っっ".to_string())
         );
     }
 

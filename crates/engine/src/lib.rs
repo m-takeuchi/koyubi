@@ -1,9 +1,11 @@
 pub mod composer;
+pub mod config;
 pub mod dict;
 pub mod romaji;
 
 /// IME の入力モード
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InputMode {
     /// ASCII 直接入力（IME OFF）
     Ascii,

@@ -139,6 +139,75 @@ pub fn to_key_event(wparam: WPARAM, lparam: LPARAM) -> Option<KeyEvent> {
     })
 }
 
+/// SandS 用: Shift を強制した状態で KeyEvent に変換する。
+///
+/// kbd_state に VK_SHIFT を強制設定してから ToUnicode を呼ぶ。
+/// 戻り値の `shift` は常に `true`。
+pub fn to_key_event_with_forced_shift(wparam: WPARAM, lparam: LPARAM) -> Option<KeyEvent> {
+    let vk = wparam.0 as u16;
+
+    // 修飾キー単体は無視
+    if vk == VK_SHIFT.0 || vk == VK_CONTROL.0 || vk == VK_MENU.0 {
+        return None;
+    }
+
+    let mut kbd_state = [0u8; 256];
+    unsafe {
+        if GetKeyboardState(&mut kbd_state).is_err() {
+            kbd_state.fill(0);
+        }
+    }
+
+    let ctrl = is_key_down(&kbd_state, VK_CONTROL);
+    let alt = is_key_down(&kbd_state, VK_MENU);
+
+    // Shift を強制設定
+    kbd_state[VK_SHIFT.0 as usize] = 0x80;
+    // 左 Shift も設定（ToUnicode が参照する場合に備えて）
+    kbd_state[0xA0] = 0x80; // VK_LSHIFT
+
+    // 非文字キーの直接マッピング
+    let key = match vk {
+        v if v == VK_RETURN.0 => Key::Enter,
+        v if v == VK_SPACE.0 => Key::Space,
+        v if v == VK_BACK.0 => Key::Backspace,
+        v if v == VK_ESCAPE.0 => Key::Escape,
+        v if v == VK_TAB.0 => Key::Tab,
+        _ => {
+            // Ctrl 押下時は kbd_state から Ctrl をクリア
+            let mut state_for_tounicode = kbd_state;
+            if ctrl {
+                state_for_tounicode[VK_CONTROL.0 as usize] = 0;
+                state_for_tounicode[0xA2] = 0; // VK_LCONTROL
+                state_for_tounicode[0xA3] = 0; // VK_RCONTROL
+            }
+
+            let sc = scan_code(lparam);
+            let mut buf = [0u16; 4];
+            let result = unsafe {
+                ToUnicode(vk as u32, sc, Some(&state_for_tounicode), &mut buf, 0)
+            };
+
+            if result == 1 {
+                if let Some(ch) = char::from_u32(buf[0] as u32) {
+                    Key::Char(ch)
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some(KeyEvent {
+        key,
+        shift: true,
+        ctrl,
+        alt,
+    })
+}
+
 /// キーを消費するかどうかの事前判定（OnTestKeyDown 用）。
 ///
 /// エンジンの process_key() を呼ばずに、キーを食べるか判定する。
@@ -171,11 +240,13 @@ pub fn should_eat_key(wparam: WPARAM, _lparam: LPARAM, engine: &SkkEngine) -> bo
         return true; // Ctrl-; (VK_OEM_1 = 0xBA)
     }
 
-    // Emacs キーバインド: 全モードで消費
-    if ctrl && !shift {
-        if vk == 0x48 {
-            return true; // Ctrl+H
-        }
+    // Ctrl+H: 常に消費（Emacs 設定に関係なく、エンジン経由で処理）
+    if ctrl && !shift && vk == 0x48 {
+        return true;
+    }
+
+    // Emacs キーバインド: 設定で有効な場合のみ消費
+    if engine.config().emacs_bindings_enabled && ctrl && !shift {
         if emacs_action(vk).is_some() {
             return true;
         }
