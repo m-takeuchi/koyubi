@@ -8,8 +8,11 @@ use std::io::Write as _;
 
 use koyubi_engine::InputMode;
 
-use windows::core::{implement, BSTR, GUID, HRESULT, Interface as _};
+use windows::core::{implement, BSTR, Interface as _};
 use windows::Win32::Foundation::{POINT, RECT};
+use windows::Win32::System::Ole::{
+    CONNECT_E_ADVISELIMIT, CONNECT_E_CANNOTCONNECT, CONNECT_E_NOCONNECTION,
+};
 use windows_core::BOOL;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, DeleteDC, DeleteObject,
@@ -18,15 +21,15 @@ use windows::Win32::Graphics::Gdi::{
     FW_BOLD, HGDIOBJ, OUT_TT_ONLY_PRECIS,
 };
 use windows::Win32::UI::TextServices::{
-    ITfLangBarItem, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
-    ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu, ITfSource, ITfSource_Impl,
-    ITfThreadMgr, TF_LANGBARITEMINFO, TF_LBI_ICON, TF_LBI_STATUS, TF_LBI_TEXT,
-    TF_LBI_TOOLTIP,
+    GUID_LBI_INPUTMODE, ITfLangBarItem, ITfLangBarItemButton, ITfLangBarItemButton_Impl,
+    ITfLangBarItemMgr, ITfLangBarItemSink, ITfLangBarItem_Impl, ITfMenu, ITfSource,
+    ITfSource_Impl, ITfThreadMgr, TF_LANGBARITEMINFO, TF_LBI_ICON, TF_LBI_STATUS,
+    TF_LBI_TEXT, TF_LBI_TOOLTIP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
 use windows_core::IUnknown;
 
-use crate::globals::{CLSID_KOYUBI_TEXT_SERVICE, GUID_LANGBAR_ITEM_BUTTON};
+use crate::globals::CLSID_KOYUBI_TEXT_SERVICE;
 
 /// デバッグログ
 macro_rules! dbglog {
@@ -45,10 +48,6 @@ macro_rules! dbglog {
 const TF_LBI_STYLE_BTN_BUTTON: u32 = 0x00010000;
 const TF_LBI_STYLE_SHOWNINTRAY: u32 = 0x00000002;
 
-/// IID for ITfLangBarItemSink
-const IID_ITF_LANG_BAR_ITEM_SINK: GUID =
-    GUID::from_u128(0x01C2D285_D71C_4564_B195_6B203356F664);
-
 /// 言語バーボタン
 #[implement(ITfLangBarItemButton, ITfLangBarItem, ITfSource)]
 pub struct LangBarButton {
@@ -66,7 +65,7 @@ impl LangBarButton {
 
         let info = TF_LANGBARITEMINFO {
             clsidService: CLSID_KOYUBI_TEXT_SERVICE,
-            guidItem: GUID_LANGBAR_ITEM_BUTTON,
+            guidItem: GUID_LBI_INPUTMODE, // Windows 8+ で必須
             dwStyle: TF_LBI_STYLE_BTN_BUTTON | TF_LBI_STYLE_SHOWNINTRAY,
             ulSort: 0,
             szDescription: desc,
@@ -97,9 +96,8 @@ pub fn add_to_lang_bar(
     button: &ITfLangBarItemButton,
 ) -> windows::core::Result<()> {
     let mgr: ITfLangBarItemMgr = thread_mgr.cast()?;
-    let item: ITfLangBarItem = button.cast()?;
     unsafe {
-        mgr.AddItem(&item)?;
+        mgr.AddItem(button)?; // ITfLangBarItemButton は ITfLangBarItem を継承
     }
     dbglog!("LangBarButton: added to lang bar");
     Ok(())
@@ -111,9 +109,8 @@ pub fn remove_from_lang_bar(
     button: &ITfLangBarItemButton,
 ) -> windows::core::Result<()> {
     let mgr: ITfLangBarItemMgr = thread_mgr.cast()?;
-    let item: ITfLangBarItem = button.cast()?;
     unsafe {
-        mgr.RemoveItem(&item)?;
+        mgr.RemoveItem(button)?;
     }
     dbglog!("LangBarButton: removed from lang bar");
     Ok(())
@@ -231,13 +228,13 @@ impl ITfLangBarItemButton_Impl for LangBarButton_Impl {
 // =========================================================
 
 impl ITfSource_Impl for LangBarButton_Impl {
-    fn AdviseSink(&self, riid: *const GUID, punk: windows::core::Ref<'_, IUnknown>) -> windows::core::Result<u32> {
+    fn AdviseSink(&self, riid: *const windows::core::GUID, punk: windows::core::Ref<'_, IUnknown>) -> windows::core::Result<u32> {
         let riid = unsafe { &*riid };
-        if *riid != IID_ITF_LANG_BAR_ITEM_SINK {
-            return Err(windows::core::Error::from_hresult(HRESULT(0x80040004u32 as i32))); // CONNECT_E_NOCONNECTION
+        if *riid != ITfLangBarItemSink::IID {
+            return Err(CONNECT_E_CANNOTCONNECT.into());
         }
         if self.sink.borrow().is_some() {
-            return Err(windows::core::Error::from_hresult(HRESULT(0x80040005u32 as i32))); // CONNECT_E_ADVISELIMIT
+            return Err(CONNECT_E_ADVISELIMIT.into());
         }
         let unk: IUnknown = punk.ok()?.clone();
         let sink: ITfLangBarItemSink = unk.cast()?;
@@ -247,7 +244,7 @@ impl ITfSource_Impl for LangBarButton_Impl {
 
     fn UnadviseSink(&self, dwcookie: u32) -> windows::core::Result<()> {
         if dwcookie != 1 || self.sink.borrow().is_none() {
-            return Err(windows::core::Error::from_hresult(HRESULT(0x80040004u32 as i32))); // CONNECT_E_NOCONNECTION
+            return Err(CONNECT_E_NOCONNECTION.into());
         }
         *self.sink.borrow_mut() = None;
         Ok(())

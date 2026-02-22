@@ -19,6 +19,20 @@ use windows_core::BOOL;
 use class_factory::ClassFactory;
 use globals::CLSID_KOYUBI_TEXT_SERVICE;
 
+/// デバッグログ
+macro_rules! dbglog {
+    ($($arg:tt)*) => {{
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(r"\\192.168.122.1\koyubi\debug.log")
+        {
+            use std::io::Write as _;
+            let _ = writeln!(f, $($arg)*);
+        }
+    }};
+}
+
 #[no_mangle]
 extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
@@ -72,14 +86,24 @@ extern "system" fn DllCanUnloadNow() -> HRESULT {
 
 #[no_mangle]
 extern "system" fn DllRegisterServer() -> HRESULT {
+    dbglog!("DllRegisterServer: called");
     let result = panic::catch_unwind(|| match register::register() {
-        Ok(()) => S_OK,
-        Err(e) => e.code(),
+        Ok(()) => {
+            dbglog!("DllRegisterServer: success");
+            S_OK
+        }
+        Err(e) => {
+            dbglog!("DllRegisterServer: failed: {:?}", e);
+            e.code()
+        }
     });
 
     match result {
         Ok(hr) => hr,
-        Err(_) => E_FAIL,
+        Err(_) => {
+            dbglog!("DllRegisterServer: panic!");
+            E_FAIL
+        }
     }
 }
 

@@ -13,7 +13,21 @@ use crate::globals::{
     self, CLSID_KOYUBI_TEXT_SERVICE, GUID_KOYUBI_PROFILE, LANGID_JA,
 };
 
+use std::io::Write as _;
+
 const DISPLAY_NAME: &str = "Koyubi SKK";
+
+macro_rules! dbglog {
+    ($($arg:tt)*) => {{
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(r"\\192.168.122.1\koyubi\debug.log")
+        {
+            let _ = writeln!(f, $($arg)*);
+        }
+    }};
+}
 
 /// DLL のファイルパスを取得する
 fn dll_path() -> Result<Vec<u16>> {
@@ -33,37 +47,50 @@ fn dll_path() -> Result<Vec<u16>> {
 
 /// TSF Text Service の登録（DllRegisterServer から呼ばれる）
 pub fn register() -> Result<()> {
+    dbglog!("register: start");
     let dll_path = dll_path()?;
+    dbglog!("register: dll_path ok");
 
     // COM InprocServer32 レジストリ登録
     register_com_server(&dll_path)?;
+    dbglog!("register: com_server ok");
 
     // ITfInputProcessorProfiles による登録
     let profiles: ITfInputProcessorProfiles = unsafe {
         CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?
     };
+    dbglog!("register: profiles created");
 
     unsafe {
         profiles.Register(&CLSID_KOYUBI_TEXT_SERVICE)?;
     }
+    dbglog!("register: Register ok");
 
-    let desc: Vec<u16> = DISPLAY_NAME.encode_utf16().collect();
+    // null 終端付き（Windows API が null 終端を期待する）
+    let desc: Vec<u16> = DISPLAY_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    let icon_path: Vec<u16> = dll_path.clone();
 
-    unsafe {
+    let result = unsafe {
         profiles.AddLanguageProfile(
             &CLSID_KOYUBI_TEXT_SERVICE,
             LANGID_JA,
             &GUID_KOYUBI_PROFILE,
             &desc,
-            &[],  // アイコンは ITfLangBarItemButton::GetIcon で提供
+            &icon_path,
             0,
-        )?;
+        )
+    };
+    match &result {
+        Ok(()) => dbglog!("register: AddLanguageProfile ok"),
+        Err(e) => dbglog!("register: AddLanguageProfile failed: {:?}", e),
     }
+    result?;
 
     // ITfCategoryMgr でキーボードカテゴリに登録
     let category_mgr: ITfCategoryMgr = unsafe {
         CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)?
     };
+    dbglog!("register: category_mgr created");
 
     unsafe {
         category_mgr.RegisterCategory(
@@ -72,6 +99,7 @@ pub fn register() -> Result<()> {
             &CLSID_KOYUBI_TEXT_SERVICE,
         )?;
     }
+    dbglog!("register: RegisterCategory ok");
 
     Ok(())
 }
