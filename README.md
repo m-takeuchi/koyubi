@@ -262,6 +262,11 @@ regsvr32.exe /u "target\release\koyubi_tsf.dll"
 - [cskk](https://github.com/naokiri/cskk) - Rust 製 SKK ライブラリ
 - [CorvusSKK](https://github.com/nathancorvussolis/corvusskk) - Windows 向け SKK 実装 (C)
 
+## 注意事項
+
+- 本プロジェクトは [Claude Code](https://claude.ai/claude-code)（Anthropic の AI コーディングツール）を使って開発されています。
+- 現時点では**英語配列キーボード（US 配列）でのみテスト**しています。日本語配列（JIS 配列）キーボードでの動作は未検証です。
+
 ## ライセンス
 
 MIT License
