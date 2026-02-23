@@ -1,0 +1,13 @@
+[package]
+name = "koyubi-dict"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "SKK dictionary manager for Koyubi"
+
+[[bin]]
+name = "koyubi-dict"
+path = "src/main.rs"
+
+[dependencies]
+ureq = { version = "3", features = ["rustls"] }

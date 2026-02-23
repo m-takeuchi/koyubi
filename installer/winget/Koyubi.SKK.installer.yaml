@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+
+PackageIdentifier: Koyubi.SKK
+PackageVersion: 0.1.0
+Platform:
+  - Windows.Desktop
+MinimumOSVersion: 10.0.0.0
+InstallerType: inno
+Scope: machine
+ElevationRequirement: elevationRequired
+Installers:
+  - Architecture: x64
+    # TODO: Update URL and hash on each release
+    InstallerUrl: https://github.com/mitch/koyubi/releases/download/v0.1.0/koyubi-0.1.0-setup.exe
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    InstallerSwitches:
+      Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+      SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART
+ManifestType: installer
+ManifestVersion: 1.6.0

@@ -1,4 +1,4 @@
 [workspace]
-members = ["crates/engine", "crates/tsf"]
+members = ["crates/engine", "crates/tsf", "crates/dict-tool"]
 default-members = ["crates/engine"]
 resolver = "2"
