@@ -5,6 +5,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::io::Write as _;
+use std::path::PathBuf;
 
 use koyubi_engine::InputMode;
 
@@ -26,7 +27,8 @@ use windows::Win32::UI::TextServices::{
     ITfSource_Impl, ITfThreadMgr, TF_LANGBARITEMINFO, TF_LBI_ICON, TF_LBI_STATUS,
     TF_LBI_TEXT, TF_LBI_TOOLTIP,
 };
-use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO, SW_SHOW};
 use windows_core::IUnknown;
 
 use crate::globals::CLSID_KOYUBI_TEXT_SERVICE;
@@ -47,6 +49,30 @@ macro_rules! dbglog {
 // TF_LBI_STYLE 定数
 const TF_LBI_STYLE_BTN_BUTTON: u32 = 0x00010000;
 const TF_LBI_STYLE_SHOWNINTRAY: u32 = 0x00000002;
+
+
+const DEFAULT_CONFIG_TOML: &str = r#"# Koyubi SKK 設定ファイル
+# 変更後、IME を再有効化（入力切替）すると反映されます。
+
+# SandS (Space and Shift) 機能
+sands_enabled = true
+
+# Emacs キーバインド (Ctrl+F/B/A/E/N/P/D/K)
+emacs_bindings_enabled = true
+
+# 起動時の入力モード ("Ascii", "Hiragana", "Katakana")
+initial_mode = "Ascii"
+
+# キーマップ
+toggle_kana = "q"
+enter_ascii = "l"
+enter_zenkaku = "L"
+prev_candidate = "x"
+
+# 辞書パス（空欄の場合は自動検出）
+# system_dict_paths = ["C:\\path\\to\\SKK-JISYO.L"]
+# user_dict_path = "C:\\Users\\...\\AppData\\Roaming\\Koyubi\\dict\\user-dict.skk"
+"#;
 
 /// 言語バーボタン
 #[implement(ITfLangBarItemButton, ITfLangBarItem, ITfSource)]
@@ -194,11 +220,14 @@ impl ITfLangBarItem_Impl for LangBarButton_Impl {
 impl ITfLangBarItemButton_Impl for LangBarButton_Impl {
     fn OnClick(
         &self,
-        _click: windows::Win32::UI::TextServices::TfLBIClick,
+        click: windows::Win32::UI::TextServices::TfLBIClick,
         _pt: &POINT,
         _prcarea: *const RECT,
     ) -> windows::core::Result<()> {
-        Ok(()) // キーバインドでモード切替するため何もしない
+        dbglog!("LangBarButton::OnClick: click={:?}", click);
+        // 左クリックで直接設定ファイルを開く（メニューが出ない環境用フォールバック）
+        open_config_file();
+        Ok(())
     }
 
     fn InitMenu(
@@ -248,6 +277,42 @@ impl ITfSource_Impl for LangBarButton_Impl {
         }
         *self.sink.borrow_mut() = None;
         Ok(())
+    }
+}
+
+// =========================================================
+// 設定ファイルを開く
+// =========================================================
+
+fn open_config_file() {
+    let appdata = match std::env::var("APPDATA") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let dir = PathBuf::from(&appdata).join("Koyubi");
+    let path = dir.join("config.toml");
+
+    // ファイルがなければデフォルト設定を書き出す
+    if !path.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(&path, DEFAULT_CONFIG_TOML);
+    }
+
+    // 既定のエディタで開く
+    let path_wide: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        ShellExecuteW(
+            None,
+            windows::core::w!("open"),
+            windows::core::PCWSTR(path_wide.as_ptr()),
+            None,
+            None,
+            SW_SHOW,
+        );
     }
 }
 

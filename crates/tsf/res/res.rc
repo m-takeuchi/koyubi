@@ -1,0 +1,3 @@
+// Koyubi SKK icon resources
+// Resource ID 101: branding icon (shown in Win11 input indicator)
+101 ICON "koyubi.ico"

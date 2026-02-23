@@ -1,12 +1,16 @@
-use windows::core::{Result, PCWSTR};
+use windows::core::{Interface as _, Result, PCWSTR};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CLASSES_ROOT, REG_SZ,
     RegCloseKey, RegCreateKeyW, RegDeleteKeyW, RegSetValueExW,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, GUID_TFCAT_TIP_KEYBOARD,
-    ITfCategoryMgr, ITfInputProcessorProfiles,
+    GUID_TFCAT_TIPCAP_COMLESS, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+    GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, GUID_TFCAT_TIPCAP_SECUREMODE,
+    GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+    ITfCategoryMgr, ITfInputProcessorProfileMgr, ITfInputProcessorProfiles,
 };
 
 use crate::globals::{
@@ -16,6 +20,9 @@ use crate::globals::{
 use std::io::Write as _;
 
 const DISPLAY_NAME: &str = "Koyubi SKK";
+
+/// DLL に埋め込まれたブランディングアイコンのリソース ID（res/res.rc で定義）
+const IDI_KOYUBI: u32 = 101;
 
 macro_rules! dbglog {
     ($($arg:tt)*) => {{
@@ -66,23 +73,33 @@ pub fn register() -> Result<()> {
     }
     dbglog!("register: Register ok");
 
+    // ITfInputProcessorProfileMgr::RegisterProfile（Win8+ 推奨 API）
+    let profile_mgr: ITfInputProcessorProfileMgr = profiles.cast()?;
+    dbglog!("register: profile_mgr created");
+
     // null 終端付き（Windows API が null 終端を期待する）
     let desc: Vec<u16> = DISPLAY_NAME.encode_utf16().chain(std::iter::once(0)).collect();
     let icon_path: Vec<u16> = dll_path.clone();
+    // 負の値 = リソース ID（MAKEINTRESOURCE 互換）
+    let icon_index = (-(IDI_KOYUBI as i32)) as u32;
 
     let result = unsafe {
-        profiles.AddLanguageProfile(
+        profile_mgr.RegisterProfile(
             &CLSID_KOYUBI_TEXT_SERVICE,
             LANGID_JA,
             &GUID_KOYUBI_PROFILE,
             &desc,
             &icon_path,
-            0,
+            icon_index,
+            HKL::default(),  // hklsubstitute: なし
+            0,               // dwPreferredLayout: なし
+            true,            // bEnabledByDefault
+            0,               // dwFlags
         )
     };
     match &result {
-        Ok(()) => dbglog!("register: AddLanguageProfile ok"),
-        Err(e) => dbglog!("register: AddLanguageProfile failed: {:?}", e),
+        Ok(()) => dbglog!("register: RegisterProfile ok"),
+        Err(e) => dbglog!("register: RegisterProfile failed: {:?}", e),
     }
     result?;
 
@@ -101,6 +118,30 @@ pub fn register() -> Result<()> {
     }
     dbglog!("register: RegisterCategory ok");
 
+    // Win11 入力インジケーター対応: 追加カテゴリ登録
+    let extra_categories = [
+        GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+        GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
+        GUID_TFCAT_TIPCAP_SECUREMODE,
+        GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+        GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
+        GUID_TFCAT_TIPCAP_COMLESS,
+    ];
+    for cat in &extra_categories {
+        let result = unsafe {
+            category_mgr.RegisterCategory(
+                &CLSID_KOYUBI_TEXT_SERVICE,
+                cat,
+                &CLSID_KOYUBI_TEXT_SERVICE,
+            )
+        };
+        match &result {
+            Ok(()) => dbglog!("register: extra category {:?} ok", cat),
+            Err(e) => dbglog!("register: extra category {:?} failed: {:?}", cat, e),
+        }
+        // 失敗してもcontinue — 全カテゴリ必須ではない
+    }
+
     Ok(())
 }
 
@@ -117,6 +158,24 @@ pub fn unregister() -> Result<()> {
                 &CLSID_KOYUBI_TEXT_SERVICE,
             )
         };
+
+        let extra_categories = [
+            GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+            GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
+            GUID_TFCAT_TIPCAP_SECUREMODE,
+            GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+            GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
+            GUID_TFCAT_TIPCAP_COMLESS,
+        ];
+        for cat in &extra_categories {
+            let _ = unsafe {
+                category_mgr.UnregisterCategory(
+                    &CLSID_KOYUBI_TEXT_SERVICE,
+                    cat,
+                    &CLSID_KOYUBI_TEXT_SERVICE,
+                )
+            };
+        }
     }
 
     // ITfInputProcessorProfiles から登録解除

@@ -394,6 +394,9 @@ fn load_dictionaries(engine: &mut SkkEngine) {
         );
     }
 
+    // 4. C:\Program Files\Koyubi\dict\ (インストーラ配置用)
+    search_paths.push(PathBuf::from(r"C:\Program Files\Koyubi\dict\SKK-JISYO.L"));
+
     for path in &search_paths {
         match Dictionary::load(path) {
             Ok(dict) => {
