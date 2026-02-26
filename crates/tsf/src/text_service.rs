@@ -16,14 +16,23 @@ use koyubi_engine::{EngineResponse, InputMode};
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 
 /// デバッグログをファイルに書き出す
+///
+/// 環境変数 KOYUBI_DEBUG にファイルパスを設定すると有効になる。
+/// 例: set KOYUBI_DEBUG=C:\koyubi\debug.log
+/// 未設定の場合は何も出力しない（パフォーマンス影響なし）。
 macro_rules! dbglog {
     ($($arg:tt)*) => {{
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(r"\\192.168.122.1\koyubi\debug.log")
-        {
-            let _ = writeln!(f, $($arg)*);
+        use std::sync::OnceLock;
+        static LOG_PATH: OnceLock<Option<String>> = OnceLock::new();
+        let path = LOG_PATH.get_or_init(|| std::env::var("KOYUBI_DEBUG").ok());
+        if let Some(ref path) = path {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(f, $($arg)*);
+            }
         }
     }};
 }
