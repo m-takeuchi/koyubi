@@ -5,9 +5,9 @@ PackageVersion: 0.1.0
 PackageLocale: en-US
 Publisher: Koyubi Project
 PackageName: Koyubi SKK
-PackageUrl: https://github.com/m-takeuchi/koyubi
+PackageUrl: https://github.com/barewalker/koyubi
 License: MIT
-LicenseUrl: https://github.com/m-takeuchi/koyubi/blob/main/LICENSE
+LicenseUrl: https://github.com/barewalker/koyubi/blob/main/LICENSE
 ShortDescription: SKK Japanese input method for Windows (English keyboard layout)
 Description: >-
   Koyubi is an SKK-based Japanese input method system for Windows,

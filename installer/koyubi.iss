@@ -4,7 +4,7 @@
 #define MyAppName "Koyubi SKK"
 #define MyAppVersion "0.1.1"
 #define MyAppPublisher "Koyubi Project"
-#define MyAppURL "https://github.com/m-takeuchi/koyubi"
+#define MyAppURL "https://github.com/barewalker/koyubi"
 
 ; AppId matches CLSID_KOYUBI_TEXT_SERVICE in globals.rs
 #define MyAppId "{{A7B3C4D5-E6F7-4890-AB12-CD34EF567890}"

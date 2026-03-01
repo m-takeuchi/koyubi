@@ -4,6 +4,7 @@
 //! ローマ字変換・辞書検索・候補選択を行う。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::config::Config;
 use crate::dict::{DictEntry, Dictionary};
@@ -28,7 +29,7 @@ pub struct SkkEngine {
     composition: CompositionState,
     romaji: RomajiConverter,
     romaji_table: RomajiTable,
-    dictionaries: Vec<Dictionary>,
+    dictionaries: Vec<Arc<Dictionary>>,
     /// 送り仮名の子音プレフィックス（送りあり変換時に使用）
     okuri_prefix: Option<String>,
     /// ユーザー辞書
@@ -68,9 +69,14 @@ impl SkkEngine {
         &self.config
     }
 
-    /// 辞書を追加
-    pub fn add_dictionary(&mut self, dict: Dictionary) {
+    /// 辞書を追加（Arc で共有可能）
+    pub fn add_dictionary(&mut self, dict: Arc<Dictionary>) {
         self.dictionaries.push(dict);
+    }
+
+    /// 辞書を追加（非共有、テスト用）
+    pub fn add_dictionary_owned(&mut self, dict: Dictionary) {
+        self.dictionaries.push(Arc::new(dict));
     }
 
     /// ユーザー辞書を設定（ファイルがなければ空辞書で作成）
@@ -1370,7 +1376,7 @@ mod tests {
 
     fn engine_with_dict() -> SkkEngine {
         let mut engine = hiragana_engine();
-        engine.add_dictionary(test_dict());
+        engine.add_dictionary_owned(test_dict());
         engine
     }
 
@@ -1622,7 +1628,7 @@ mod tests {
     fn test_katakana_confirm_and_continue() {
         // カタカナモードで▼確定後の続き入力もカタカナ
         let mut engine = katakana_engine();
-        engine.add_dictionary(test_dict());
+        engine.add_dictionary_owned(test_dict());
         engine.process_key(shift_key('K'));
         engine.process_key(key('a'));
         engine.process_key(key('n'));
@@ -2138,7 +2144,7 @@ mod tests {
         let dict = Dictionary::from_str(
             "てすと /A/B/C/D/E/F/G/H/I/J/K/L/\n",
         );
-        engine.add_dictionary(dict);
+        engine.add_dictionary_owned(dict);
 
         engine.process_key(shift_key('T'));
         engine.process_key(key('e'));
@@ -2166,7 +2172,7 @@ mod tests {
         let dict = Dictionary::from_str(
             "てすと /A/B/C/D/E/F/G/H/I/J/K/L/\n",
         );
-        engine.add_dictionary(dict);
+        engine.add_dictionary_owned(dict);
 
         engine.process_key(shift_key('T'));
         engine.process_key(key('e'));
@@ -2273,7 +2279,7 @@ mod tests {
     fn test_full_workflow_toukyou() {
         // ASCII モードから開始して Ctrl-Space で IME ON
         let mut engine = SkkEngine::default();
-        engine.add_dictionary(test_dict());
+        engine.add_dictionary_owned(test_dict());
 
         engine.process_key(ctrl_space());
         assert_eq!(engine.current_mode(), InputMode::Hiragana);
@@ -2353,7 +2359,7 @@ mod tests {
         // 最終候補を超えて Space → 登録モードに遷移
         let mut engine = hiragana_engine();
         let dict = Dictionary::from_str("ひと /人/\n");
-        engine.add_dictionary(dict);
+        engine.add_dictionary_owned(dict);
 
         engine.process_key(shift_key('H'));
         engine.process_key(key('i'));

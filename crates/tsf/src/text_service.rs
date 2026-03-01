@@ -7,6 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 
 use koyubi_engine::composer::SkkEngine;
 use koyubi_engine::config::Config;
@@ -31,6 +32,14 @@ macro_rules! dbglog {
                 .append(true)
                 .open(path)
             {
+                use std::time::SystemTime;
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let secs = now.as_secs() % 86400; // 時刻部分のみ
+                let millis = now.subsec_millis();
+                let _ = write!(f, "{:02}:{:02}:{:02}.{:03} ",
+                    secs / 3600, (secs % 3600) / 60, secs % 60, millis);
                 let _ = writeln!(f, $($arg)*);
             }
         }
@@ -87,6 +96,7 @@ pub struct TextService {
     sands_state: Cell<SandsState>,
     thumb_shift_held: Cell<bool>,
     caps_ctrl_held: Cell<bool>,
+    dicts_loaded: Cell<bool>,
 }
 
 impl TextService {
@@ -102,6 +112,7 @@ impl TextService {
             sands_state: Cell::new(SandsState::Idle),
             thumb_shift_held: Cell::new(false),
             caps_ctrl_held: Cell::new(false),
+            dicts_loaded: Cell::new(false),
         }
     }
 
@@ -313,6 +324,23 @@ impl TextService {
         }
     }
 
+    /// バックグラウンドでロードされた辞書をエンジンに追加する（ノンブロッキング）
+    ///
+    /// OnceLock::get() で辞書の準備状況をチェックし、
+    /// ロード完了していればエンジンに追加する。ブロックしない。
+    fn ensure_dictionaries_loaded(&self) {
+        if self.dicts_loaded.get() {
+            return;
+        }
+        if let Some(dicts) = CACHED_SYSTEM_DICTS.get() {
+            for dict in dicts {
+                self.engine.borrow_mut().add_dictionary(Arc::clone(dict));
+            }
+            self.dicts_loaded.set(true);
+            dbglog!("Dictionaries attached to engine ({} dicts)", dicts.len());
+        }
+    }
+
     /// 候補ウィンドウの表示/非表示を同期する
     fn sync_candidate_window(&self, context: &ITfContext) {
         let info = self.engine.borrow().candidate_info();
@@ -361,12 +389,37 @@ fn get_dll_directory() -> Option<PathBuf> {
     path.parent().map(|p| p.to_path_buf())
 }
 
-/// 辞書を検索パスから読み込む
-fn load_dictionaries(engine: &mut SkkEngine) {
+/// プロセス内で辞書を共有するためのキャッシュ
+///
+/// TSF DLL はテキスト入力を使うすべてのプロセスに読み込まれるため、
+/// 辞書のロード（4MB+ のファイル読み込み・パース）をプロセスあたり1回に抑える。
+/// バックグラウンドスレッドで初期化し、UI スレッドをブロックしない。
+static CACHED_SYSTEM_DICTS: OnceLock<Vec<Arc<Dictionary>>> = OnceLock::new();
+
+/// 辞書のバックグラウンドプリロードを開始する
+///
+/// 別スレッドで辞書をロードし、CACHED_SYSTEM_DICTS に格納する。
+/// Activate からの呼び出しで UI スレッドをブロックしない。
+fn start_dict_preload(config: &Config) {
+    if CACHED_SYSTEM_DICTS.get().is_some() {
+        return; // 既にロード済み
+    }
+    let config = config.clone();
+    std::thread::spawn(move || {
+        CACHED_SYSTEM_DICTS.get_or_init(|| {
+            load_dictionaries_from_disk(&config)
+        });
+        dbglog!("Dictionary preload completed in background thread");
+    });
+}
+
+/// 辞書をディスクから読み込む（初回のみ呼ばれる）
+fn load_dictionaries_from_disk(config: &Config) -> Vec<Arc<Dictionary>> {
+    let mut result = Vec::new();
+
     // config で明示的にパスが指定されている場合はそれを使用
-    let config_paths = engine.config().system_dict_paths.clone();
-    if !config_paths.is_empty() {
-        for path_str in &config_paths {
+    if !config.system_dict_paths.is_empty() {
+        for path_str in &config.system_dict_paths {
             let path = PathBuf::from(path_str);
             match Dictionary::load(&path) {
                 Ok(dict) => {
@@ -375,14 +428,14 @@ fn load_dictionaries(engine: &mut SkkEngine) {
                         path,
                         dict.entry_count()
                     );
-                    engine.add_dictionary(dict);
+                    result.push(Arc::new(dict));
                 }
                 Err(e) => {
                     dbglog!("Dictionary not found (config): {:?} ({:?})", path, e);
                 }
             }
         }
-        return;
+        return result;
     }
 
     // 自動検出
@@ -422,15 +475,15 @@ fn load_dictionaries(engine: &mut SkkEngine) {
                     path,
                     dict.entry_count()
                 );
-                engine.add_dictionary(dict);
-                return; // 最初に見つかった辞書を使用
+                result.push(Arc::new(dict));
+                return result; // 最初に見つかった辞書を使用
             }
             Err(e) => {
                 dbglog!("Dictionary not found: {:?} ({:?})", path, e);
             }
         }
     }
-    dbglog!("WARNING: No dictionary found");
+    result
 }
 
 /// ユーザー辞書パスを設定
@@ -632,10 +685,11 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
         };
         dbglog!("Config: sands={}, emacs={}, initial_mode={:?}",
             config.sands_enabled, config.emacs_bindings_enabled, config.initial_mode);
-        *self.engine.borrow_mut() = SkkEngine::new(config);
+        *self.engine.borrow_mut() = SkkEngine::new(config.clone());
+        self.dicts_loaded.set(false);
 
-        // 辞書読み込み
-        load_dictionaries(&mut self.engine.borrow_mut());
+        // 辞書をバックグラウンドでプリロード（UI スレッドをブロックしない）
+        start_dict_preload(&config);
 
         // ユーザー辞書設定
         load_user_dictionary(&mut self.engine.borrow_mut());
@@ -856,6 +910,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         let context: ITfContext = pic.ok()?.clone();
         let vk = wparam.0 as u16;
         let sands_enabled = self.engine.borrow().config().sands_enabled;
+
+        // バックグラウンドでロードされた辞書を取り込む（ノンブロッキング）
+        self.ensure_dictionaries_loaded();
 
         // SendInput で注入したキーはスルー（SandS / CapsLock→Ctrl 共通）
         if unsafe { GetMessageExtraInfo() }.0 as usize == SANDS_INJECTED {
